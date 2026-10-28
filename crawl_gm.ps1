@@ -171,6 +171,19 @@ function Format-ChartXml([string]$xml) {
     return ($lines -join "`n")
 }
 
+function Format-LabelTree([string]$raw) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($m in [regex]::Matches([string]$raw, '"name"\s*:\s*"((?:\\.|[^"\\])*)"')) {
+        $parts = ([regex]::Unescape($m.Groups[1].Value)) -split "`n"
+        $lines.Add(($parts -join " | "))
+    }
+    if ($lines.Count -eq 0) {
+        if ($raw.Length -gt 500) { return $raw.Substring(0, 500) }
+        return $raw
+    }
+    return ($lines -join "`n")
+}
+
 function Get-OwnChartPaths([string]$html, [string]$companyId) {
     $list = New-Object System.Collections.Generic.List[string]
     foreach ($m in [regex]::Matches($html, '/BSTCS/ChartAction\.do\?[^"''\s<]+')) {
@@ -210,11 +223,49 @@ function Find-LeftDocument($rootDoc) {
     return $null
 }
 
+function Get-QuarterOptions([string]$html) {
+    $vals = New-Object System.Collections.Generic.List[int]
+    foreach ($s in [regex]::Matches([string]$html, "(?is)<select\b([^>]*)>(.*?)</select>")) {
+        $attrs = $s.Groups[1].Value
+        if ($attrs -notmatch "(?i)\b(?:id|name)\s*=\s*['""]?(?:selecttime|select_time|time)['""]?(?=[\s>]|$)") { continue }
+        foreach ($o in [regex]::Matches($s.Groups[2].Value, "(?i)\bvalue\s*=\s*['""]?(\d+)")) {
+            $n = [int]$o.Groups[1].Value
+            if ($n -gt 0 -and -not $vals.Contains($n)) { $vals.Add($n) }
+        }
+    }
+    return @($vals)
+}
+
+function Set-Query([string]$url, [hashtable]$set) {
+    $basePart = $url
+    $query = ""
+    $q = $url.IndexOf("?")
+    if ($q -ge 0) {
+        $basePart = $url.Substring(0, $q)
+        $query = $url.Substring($q + 1)
+    }
+    $map = [ordered]@{}
+    if ($query) {
+        foreach ($part in ($query -split "&")) {
+            if ([string]::IsNullOrEmpty($part)) { continue }
+            $eq = $part.IndexOf("=")
+            if ($eq -lt 0) { $map[$part] = "" }
+            else { $map[$part.Substring(0, $eq)] = $part.Substring($eq + 1) }
+        }
+    }
+    foreach ($key in @($set.Keys)) { $map[$key] = [string]$set[$key] }
+    $pairs = @()
+    foreach ($key in $map.Keys) { $pairs += ($key + "=" + $map[$key]) }
+    if ($pairs.Count -eq 0) { return $basePart }
+    return $basePart + "?" + ($pairs -join "&")
+}
+
 function Get-SelectNumbers([string]$html, [string]$field) {
     $block = [regex]::Match([string]$html, "(?is)<select\b[^>]*\bname\s*=\s*['""]?$field\b[^>]*>(.*?)</select>")
     if (-not $block.Success) { return @() }
+    $inner = [regex]::Replace($block.Groups[1].Value, '(?s)<!--.*?-->', '')
     $nums = New-Object System.Collections.Generic.List[int]
-    foreach ($o in [regex]::Matches($block.Groups[1].Value, "(?i)\bvalue\s*=\s*['""]?(\d+)")) {
+    foreach ($o in [regex]::Matches($inner, "(?i)\bvalue\s*=\s*['""]?(\d+)")) {
         $n = [int]$o.Groups[1].Value
         if (-not $nums.Contains($n)) { $nums.Add($n) }
     }
@@ -379,6 +430,49 @@ foreach ($p in $pages) {
             section = $p.Section; group = $p.Group; name = $p.Name; url = $p.Url
             status = $res.status; chars = $text.Length; file = $baseName
         })
+        $quarters = @(Get-QuarterOptions $html)
+        if ($quarters.Count -gt 1 -and $p.Url -notmatch "report_bster_company\.jsp") {
+            foreach ($qt in $quarters) {
+                $qset = @{ time = "$qt"; timeid = "$qt"; companyid = $companyId }
+                if ($p.Url -notmatch '(?i)(?:\?|&)databasename=') { $qset.databasename = "null" }
+                $qurl = Set-Query $p.Url $qset
+                Write-Host ("  quarter {0}" -f $qt)
+                $qres = Invoke-PageGet $left $qurl
+                $qhtml = [string]$qres.body
+                $qtext = Get-PlainText $qhtml
+                $qnotes = New-Object System.Collections.Generic.List[string]
+                foreach ($chartPath in (Get-OwnChartPaths $qhtml $companyId)) {
+                    $chart = Invoke-PageGet $left ($BaseUrl.TrimEnd("/") + $chartPath)
+                    if ($chart.status -eq "200") { $qnotes.Add((Format-ChartXml ([string]$chart.body))) }
+                }
+                if ($qnotes.Count -gt 0) { $qtext = $qtext + "`n`n" + ($qnotes -join "`n`n") }
+                if ([int]$qt -ge 100) { $qname = "{0}_all" -f $baseName } else { $qname = "{0}_q{1}" -f $baseName, $qt }
+                [IO.File]::WriteAllText((Join-Path $sectionDir ($qname + ".html")), $qhtml, $utf8)
+                [IO.File]::WriteAllText((Join-Path $sectionDir ($qname + ".txt")), $qtext, $utf8)
+                $manifest.Add([pscustomobject]@{
+                    section = $p.Section; group = $p.Group; name = ($p.Name + " q" + $qt); url = $qurl
+                    status = $qres.status; chars = $qtext.Length; file = $qname
+                })
+            }
+        }
+        if ($html -match 'ChartAction\.do\?type=56') {
+            $dupSel = [regex]::Match($html, "(?is)<select\b[^>]*\bid\s*=\s*['""]select_time1['""][^>]*>(.*?)</select>")
+            if ($dupSel.Success) {
+                foreach ($o in [regex]::Matches($dupSel.Groups[1].Value, "(?i)\bvalue\s*=\s*['""]?(\d+)")) {
+                    $qt = $o.Groups[1].Value
+                    $gurl = "{0}/BSTCS/ChartAction.do?type=56&databasename=null&courseid={1}&companyid1={2}&time1={3}&companyid2={2}&time2={3}&studentid={4}" -f $BaseUrl.TrimEnd("/"), $courseId, $companyId, $qt, $studentId
+                    Write-Host ("  dupont {0}" -f $qt)
+                    $chart = Invoke-PageGet $left $gurl
+                    $qtext = Format-LabelTree ([string]$chart.body)
+                    $qname = "{0}_q{1}" -f $baseName, $qt
+                    [IO.File]::WriteAllText((Join-Path $sectionDir ($qname + ".txt")), $qtext, $utf8)
+                    $manifest.Add([pscustomobject]@{
+                        section = $p.Section; group = $p.Group; name = ($p.Name + " q" + $qt); url = $gurl
+                        status = $chart.status; chars = $qtext.Length; file = $qname
+                    })
+                }
+            }
+        }
     } catch {
         Write-Host ("FAIL " + $_.Exception.Message)
         $manifest.Add([pscustomobject]@{ section = $p.Section; name = $p.Name; url = $p.Url; status = "EXC"; error = $_.Exception.Message })
